@@ -52,6 +52,7 @@ void main() {
     color *= diff;
 
     // grid
+    // TODO fix spacing of grid to be accurate
     // 1 arc-minute spacing
     float spacingNS = 1855.0;
     float spacingEW = 1855.0 * cos(radians(fragWorldPos.z / 111320.0));
