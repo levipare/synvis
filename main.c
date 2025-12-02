@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdio.h>
 
 #include <raylib.h>
 #include <raymath.h>
@@ -90,7 +91,7 @@ void update_camera_aircrat(Camera3D *camera, struct aircraft_state *ac) {
     camera->up = ac->up;
 }
 
-void handle_input() {
+void handle_input(float dt) {
     if (IsKeyPressed(KEY_C)) {
         freecam = !freecam;
         if (freecam) {
@@ -123,7 +124,7 @@ void handle_input() {
         if (IsKeyDown(KEY_LEFT_SHIFT))
             speed *= FAST_MULTIPLIER;
 
-        float ds = speed * GetFrameTime(); // m/s → meters per frame
+        float ds = speed * dt; // m/s -> meters per frame
         worldMove = Vector3Scale(worldMove, ds);
 
         // Convert meters → geodetic update
@@ -153,13 +154,23 @@ void handle_input() {
             aircraft_yaw(&ac, 0.01);
         if (IsKeyDown(KEY_E))
             aircraft_yaw(&ac, -0.01);
+
+        float pitch = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y);
+        float roll = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X);
+        float yaw = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_X);
+        aircraft_pitch(&ac, dt * pitch * 15 * DEG2RAD);
+        aircraft_roll(&ac, dt * roll * 20 * DEG2RAD);
+        aircraft_yaw(&ac, dt * -yaw * 15 * DEG2RAD);
     }
 }
 
 int main(void) {
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI);
     InitWindow(1024, 768, "synvis");
     DisableCursor();
+    SetTargetFPS(60);
+    SetGamepadMappings("030000006d04000015c2000010010000,Logitech Logitech Extreme "
+                       "3D,leftx:a0,lefty:a1,rightx:a2");
 
     Camera camera = {0};
     camera.position = (Vector3){0, 0, 0};
@@ -209,16 +220,17 @@ int main(void) {
     SetShaderValue(shader, lightDirLoc, (float[3]){lightDir.x, lightDir.y, lightDir.z},
                    SHADER_UNIFORM_VEC3);
 
-    SetTargetFPS(60);
     rlDisableBackfaceCulling();
     rlSetClipPlanes(1, 1000000);
-    while (!WindowShouldClose()) // Detect window close button or ESC key
-    {
-        handle_input();
+    while (!WindowShouldClose()) {
+        int width = GetRenderWidth();
+        int height = GetRenderHeight();
+        // printf("%dx%d\n", width, height);
+
+        handle_input(GetFrameTime());
         update_camera_aircrat(&camera, &ac);
 
         BeginDrawing();
-
         ClearBackground((Color){28, 57, 195});
 
         BeginMode3D(camera);
@@ -253,6 +265,18 @@ int main(void) {
 
         EndMode3D();
 
+        EndTextureMode();
+
+        // aircraft symbol
+        Vector2 o = {width / 2.0, height / 2.0};
+        Vector2 left[3] = {{o.x - 120, o.y + 40}, {o.x - 80, o.y + 40}, o};
+        Vector2 right[3] = {{o.x + 120, o.y + 40}, {o.x + 80, o.y + 40}, o};
+        DrawTriangle(left[0], left[1], left[2], YELLOW);
+        DrawTriangleLines(left[0], left[1], left[2], BLACK);
+        DrawTriangle(right[0], right[1], right[2], YELLOW);
+        DrawTriangleLines(right[0], right[1], right[2], BLACK);
+
+        // debug
         DrawFPS(10, 10);
         DrawText(TextFormat("lat=%f", ac.lat), 10, 40, 20, WHITE);
         DrawText(TextFormat("lon=%f", ac.lon), 10, 70, 20, WHITE);
