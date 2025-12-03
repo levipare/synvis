@@ -1,6 +1,5 @@
 #version 330
 
-uniform vec3 lightDir;
 uniform float heightmapSize;
 uniform float chunkSize;
 
@@ -48,7 +47,7 @@ void main() {
 
     // shading
     vec3 norm = normalize(normal);
-    float diff = max(dot(norm, lightDir), 0.2);
+    float diff = max(dot(norm, vec3(0.5, 1.0, 0.5)), 0.2);
     color *= diff;
 
     // grid

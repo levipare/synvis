@@ -1,28 +1,151 @@
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
-#include <raylib.h>
-#include <raymath.h>
-#include <rcamera.h>
-#include <rlgl.h>
+#define SDL_MAIN_USE_CALLBACKS 1
+#include <GL/glew.h>
+#include <SDL3/SDL.h>
+#include <SDL3/SDL_main.h>
+#include <cglm/struct.h>
+
+#define CIMGUI_DEFINE_ENUMS_AND_STRUCTS
+#define CIMGUI_USE_SDL3
+#define CIMGUI_USE_OPENGL3
+#include "cimgui.h"
+#include "cimgui_impl.h"
 
 #include "aircraft_state.h"
 
-#define WGS84_A 6378137.0         // major axis
-#define WGS84_E2 6.69437999014e-3 // eccentricity^2
+static SDL_Window *window;
+static SDL_GLContext glctx;
+static SDL_Joystick *joy;
+static Uint64 last_tick;
+static float mouse_dx, mouse_dy;
 
 #define TILE_RES 1200
-#define TILE_WORLD_SIZE (111320 * cos(44.0 * DEG2RAD))
+#define TILE_WORLD_SIZE (111320 * cos(glm_rad(44)))
 #define NUM_CHUNKS 6
 #define CHUNK_RES (TILE_RES / NUM_CHUNKS)
 #define CHUNK_WORLD_SIZE (TILE_WORLD_SIZE / NUM_CHUNKS)
 
-#define CAMERA_MOUSE_SENS 0.003f
-#define CAMERA_BASE_SPEED 100.0f
-#define FAST_MULTIPLIER 100.0f
+#define CAMERA_SENS 0.1
+#define JOYSTICK_DEADZONE 0.1
 
-Vector3 worldOffset = {0};
-bool freecam = true;
+GLuint compile_shader(const char *path, GLenum type) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Missing shader %s\n", path);
+        exit(1);
+    }
+
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char *src = malloc(sz + 1);
+    fread(src, 1, sz, f);
+    fclose(f);
+    src[sz] = 0;
+
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, (const char **)&src, NULL);
+    glCompileShader(sh);
+
+    GLint ok;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[2048];
+        glGetShaderInfoLog(sh, sizeof(log), NULL, log);
+        fprintf(stderr, "Shader compile error in %s:\n%s\n", path, log);
+        exit(1);
+    }
+    free(src);
+    return sh;
+}
+
+GLuint load_program(const char *vs, const char *fs) {
+    GLuint v = compile_shader(vs, GL_VERTEX_SHADER);
+    GLuint f = compile_shader(fs, GL_FRAGMENT_SHADER);
+
+    GLuint p = glCreateProgram();
+    glAttachShader(p, v);
+    glAttachShader(p, f);
+    glLinkProgram(p);
+
+    GLint ok;
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[2048];
+        glGetProgramInfoLog(p, sizeof(log), NULL, log);
+        fprintf(stderr, "Link error:\n%s\n", log);
+        exit(1);
+    }
+    glDeleteShader(v);
+    glDeleteShader(f);
+    return p;
+}
+
+typedef struct {
+    GLuint vao, vbo, ebo;
+    GLsizei indexCount;
+} Mesh;
+
+Mesh gen_plane(float w, float h, int resx, int resz) {
+    int vx = resx + 1;
+    int vz = resz + 1;
+    int vcount = vx * vz;
+
+    float *verts = malloc(sizeof(float) * vcount * 5);
+    unsigned *indices = malloc(sizeof(unsigned) * resx * resz * 6);
+
+    int idx = 0;
+    for (int z = 0; z < vz; z++)
+        for (int x = 0; x < vx; x++) {
+            float px = ((float)x / resx - 0.5f) * w;
+            float pz = ((float)z / resz - 0.5f) * h;
+            verts[idx++] = px;
+            verts[idx++] = 0.0f;
+            verts[idx++] = pz;
+            verts[idx++] = (float)x / (vx - 1);
+            verts[idx++] = (float)z / (vz - 1);
+        }
+
+    idx = 0;
+    for (int z = 0; z < resz; z++)
+        for (int x = 0; x < resx; x++) {
+            int i = z * vx + x;
+            indices[idx++] = i;
+            indices[idx++] = i + vx;
+            indices[idx++] = i + 1;
+            indices[idx++] = i + 1;
+            indices[idx++] = i + vx;
+            indices[idx++] = i + vx + 1;
+        }
+
+    Mesh m;
+    glGenVertexArrays(1, &m.vao);
+    glBindVertexArray(m.vao);
+
+    glGenBuffers(1, &m.vbo);
+    glBindBuffer(GL_ARRAY_BUFFER, m.vbo);
+    glBufferData(GL_ARRAY_BUFFER, vcount * 5 * sizeof(float), verts, GL_STATIC_DRAW);
+
+    glGenBuffers(1, &m.ebo);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m.ebo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, resx * resz * 6 * sizeof(unsigned), indices,
+                 GL_STATIC_DRAW);
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 5, 0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 5, (void *)(3 * sizeof(float)));
+
+    m.indexCount = resx * resz * 6;
+
+    free(verts);
+    free(indices);
+    return m;
+}
 
 struct aircraft_state ac = {
     .speed = 200,
@@ -34,262 +157,260 @@ struct aircraft_state ac = {
     .right = {-1, 0, 0},
 };
 
-Vector3 geodetic_to_ecef(double lat, double lon, double alt) {
-    double sinLat = sin(lat);
-    double cosLat = cos(lat);
-    double sinLon = sin(lon);
-    double cosLon = cos(lon);
+vec3s world_offset = {0, 0, 0};
 
-    double N = WGS84_A / sqrt(1.0 - WGS84_E2 * sinLat * sinLat);
-
-    Vector3 ecef;
-    ecef.x = (N + alt) * cosLat * cosLon;
-    ecef.y = (N + alt) * cosLat * sinLon;
-    ecef.z = ((1.0 - WGS84_E2) * N + alt) * sinLat;
-
-    return ecef;
-}
-
-Vector3 ecef_to_enu(Vector3 p, Vector3 origin, double lat0, double lon0) {
-    double sinLat = sin(lat0), cosLat = cos(lat0);
-    double sinLon = sin(lon0), cosLon = cos(lon0);
-
-    // Translate to origin
-    double dx = p.x - origin.x;
-    double dy = p.y - origin.y;
-    double dz = p.z - origin.z;
-
-    Vector3 enu;
-
-    // ENU conversion matrix
-    enu.x = -sinLon * dx + cosLon * dy;                                 // east
-    enu.y = -sinLat * cosLon * dx - sinLat * sinLon * dy + cosLat * dz; // north
-    enu.z = cosLat * cosLon * dx + cosLat * sinLon * dy + sinLat * dz;  // up
-
-    return enu;
-}
-
-Vector3 geodetic_to_enu(double lat, double lon, double alt, double lat0, double lon0,
-                        Vector3 originECEF) {
-
-    Vector3 pECEF = geodetic_to_ecef(lat, lon, alt);
-    return ecef_to_enu(pECEF, originECEF, lat0, lon0);
-}
-
-void update_camera_aircrat(Camera3D *camera, struct aircraft_state *ac) {
-    double lat0 = 0.0;
-    double lon0 = 0.0;
-    Vector3 originECEF = geodetic_to_ecef(lat0, lon0, 0.0);
-    Vector3 enu =
-        geodetic_to_enu(ac->lat * DEG2RAD, ac->lon * DEG2RAD, ac->alt, lat0, lon0, originECEF);
-
-    worldOffset.x = enu.x; // east
-    worldOffset.y = enu.z; // up
-    worldOffset.z = enu.y; // north
-
-    camera->target = ac->forward; // since camera is fixed at 0,0,0
-    camera->up = ac->up;
-}
-
-void handle_input(float dt) {
-    if (IsKeyPressed(KEY_C)) {
-        freecam = !freecam;
-        if (freecam) {
-            ac.up = (Vector3){0, 1, 0}; // reset the up vector so that in freecam, there is no roll
-        }
-    }
+bool freecam = true;
+void update(float dt) {
+    const bool *keys = SDL_GetKeyboardState(NULL);
     if (freecam) {
-        Vector3 move = {0};
-        if (IsKeyDown(KEY_W))
+        vec3s move = {0};
+        if (keys[SDL_SCANCODE_W])
             move.z += 1;
-        if (IsKeyDown(KEY_S))
+        if (keys[SDL_SCANCODE_S])
             move.z -= 1;
-        if (IsKeyDown(KEY_D))
-            move.x += 1;
-        if (IsKeyDown(KEY_A))
+        if (keys[SDL_SCANCODE_A])
             move.x -= 1;
-        if (IsKeyDown(KEY_SPACE))
+        if (keys[SDL_SCANCODE_D])
+            move.x += 1;
+        if (keys[SDL_SCANCODE_SPACE])
             move.y += 1;
-        if (IsKeyDown(KEY_LEFT_CONTROL))
+        if (keys[SDL_SCANCODE_LCTRL])
             move.y -= 1;
 
-        if (Vector3Length(move) > 0.001)
-            move = Vector3Normalize(move);
+        vec3s world_move = glms_vec3_add(
+            glms_vec3_scale(ac.forward, move.z),
+            glms_vec3_add(glms_vec3_scale(ac.right, move.x), glms_vec3_scale(ac.up, move.y)));
 
-        Vector3 worldMove =
-            Vector3Add(Vector3Scale(ac.forward, move.z),
-                       Vector3Add(Vector3Scale(ac.right, move.x), Vector3Scale(ac.up, move.y)));
+        float speed = 100;
+        if (keys[SDL_SCANCODE_LSHIFT])
+            speed *= 100;
 
-        float speed = CAMERA_BASE_SPEED;
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            speed *= FAST_MULTIPLIER;
+        float ds = speed * dt; // m/s → meters per frame
+        world_move = glms_vec3_scale(world_move, ds);
 
-        float ds = speed * dt; // m/s -> meters per frame
-        worldMove = Vector3Scale(worldMove, ds);
+        // Convert meters -> geodetic update
+        ac.lat += world_move.z / 111320.0;                          // north (ENU y)
+        ac.lon += world_move.x / (111320.0 * cos(glm_rad(ac.lat))); // east (ENU x)
+        ac.alt += world_move.y;                                     // up is ENU z
 
-        // Convert meters → geodetic update
-        ac.lat += worldMove.z / 111320.0;                           // north (ENU y)
-        ac.lon += worldMove.x / (111320.0 * cos(ac.lat * DEG2RAD)); // east (ENU x)
-        ac.alt += worldMove.y;                                      // up is ENU z
-
-        Vector2 md = GetMouseDelta();
         // pitch
-        float pitch_angle = -md.y * CAMERA_MOUSE_SENS;
-        ac.forward = Vector3RotateByAxisAngle(ac.forward, ac.right, pitch_angle);
-        ac.right = Vector3Normalize(Vector3CrossProduct(ac.forward, ac.up));
+        float pitch_angle = -mouse_dy * CAMERA_SENS * dt;
+        ac.forward = glms_vec3_rotate(ac.forward, pitch_angle, ac.right);
+        ac.right = glms_vec3_normalize(glms_vec3_cross(ac.forward, ac.up));
         // yaw
-        float yaw_angle = -md.x * CAMERA_MOUSE_SENS;
-        ac.forward = Vector3RotateByAxisAngle(ac.forward, ac.up, yaw_angle);
+        float yaw_angle = -mouse_dx * CAMERA_SENS * dt;
+        ac.forward = glms_vec3_rotate(ac.forward, yaw_angle, ac.up);
     } else {
-        aircraft_update(&ac, GetFrameTime());
-        if (IsKeyDown(KEY_W))
-            aircraft_pitch(&ac, -0.01);
-        if (IsKeyDown(KEY_S))
-            aircraft_pitch(&ac, 0.01);
-        if (IsKeyDown(KEY_A))
-            aircraft_roll(&ac, -0.01);
-        if (IsKeyDown(KEY_D))
-            aircraft_roll(&ac, 0.01);
-        if (IsKeyDown(KEY_Q))
-            aircraft_yaw(&ac, 0.01);
-        if (IsKeyDown(KEY_E))
-            aircraft_yaw(&ac, -0.01);
+        aircraft_update(&ac, dt);
 
-        float pitch = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_Y);
-        float roll = GetGamepadAxisMovement(0, GAMEPAD_AXIS_LEFT_X);
-        float yaw = GetGamepadAxisMovement(0, GAMEPAD_AXIS_RIGHT_X);
-        aircraft_pitch(&ac, dt * pitch * 15 * DEG2RAD);
-        aircraft_roll(&ac, dt * roll * 20 * DEG2RAD);
-        aircraft_yaw(&ac, dt * -yaw * 15 * DEG2RAD);
+        float pitch = (float)SDL_GetJoystickAxis(joy, 1) / SDL_JOYSTICK_AXIS_MIN;
+        aircraft_pitch(&ac, glm_rad(-pitch));
+        float roll = (float)SDL_GetJoystickAxis(joy, 0) / SDL_JOYSTICK_AXIS_MIN;
+        aircraft_roll(&ac, glm_rad(-roll));
+        float yaw = (float)SDL_GetJoystickAxis(joy, 2) / SDL_JOYSTICK_AXIS_MIN;
+        aircraft_yaw(&ac, glm_rad(yaw));
     }
+
+    // update world offset based on aircraft
+    double lat0 = 0.0;
+    double lon0 = 0.0;
+    vec3s originECEF = geodetic_to_ecef(lat0, lon0, 0.0);
+    vec3s enu = geodetic_to_enu(glm_rad(ac.lat), glm_rad(ac.lon), ac.alt, lat0, lon0, originECEF);
+
+    world_offset.x = enu.x; // east
+    world_offset.y = enu.z; // up
+    world_offset.z = enu.y; // north
 }
 
-int main(void) {
-    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_HIGHDPI);
-    InitWindow(1024, 768, "synvis");
-    DisableCursor();
-    SetTargetFPS(60);
-    SetGamepadMappings("030000006d04000015c2000010010000,Logitech Logitech Extreme "
-                       "3D,leftx:a0,lefty:a1,rightx:a2");
-
-    Camera camera = {0};
-    camera.position = (Vector3){0, 0, 0};
-    camera.target = (Vector3){1, 0, 0};
-    camera.up = (Vector3){0, 1, 0};
-    camera.fovy = 60.0f;
-    camera.projection = CAMERA_PERSPECTIVE;
-
-    Image dem_img = LoadImageRaw("dem.raw", TILE_RES, TILE_RES, RL_PIXELFORMAT_UNCOMPRESSED_R32, 0);
-    Texture dem_tex = LoadTextureFromImage(dem_img);
-    UnloadImage(dem_img);
-    Image wbm_img =
-        LoadImageRaw("wbm_sdf.raw", TILE_RES, TILE_RES, RL_PIXELFORMAT_UNCOMPRESSED_R32, 0);
-    Texture wbm_tex = LoadTextureFromImage(wbm_img);
-    UnloadImage(wbm_img);
-
-    // Terrain shader
-    Shader shader = LoadShader("shaders/terrain.vs", "shaders/terrain.fs");
-    int heightmapLoc = GetShaderLocation(shader, "heightmap");
-    rlEnableShader(shader.id);
-    rlActiveTextureSlot(1);
-    rlEnableTexture(dem_tex.id);
-    rlSetUniformSampler(heightmapLoc, 1);
-    int watermaskLoc = GetShaderLocation(shader, "watermask");
-    rlEnableShader(shader.id);
-    rlActiveTextureSlot(2);
-    rlEnableTexture(wbm_tex.id);
-    rlSetUniformSampler(watermaskLoc, 2);
-
-    // Create a plane mesh and model
-    Mesh mesh = GenMeshPlane(CHUNK_WORLD_SIZE, CHUNK_WORLD_SIZE, CHUNK_RES, CHUNK_RES);
-    Model chunkModel = LoadModelFromMesh(mesh);
-    chunkModel.materials[0].shader = shader;
-
-    int chunkOffsetLoc = GetShaderLocation(shader, "chunkOffset");
-    int heightmapSizeLoc = GetShaderLocation(shader, "heightmapSize");
-    int chunkResLoc = GetShaderLocation(shader, "chunkRes");
-    int chunkSizeLoc = GetShaderLocation(shader, "chunkSize");
-    int lightDirLoc = GetShaderLocation(shader, "lightDir");
-    int aircraftPosLoc = GetShaderLocation(shader, "aircraftPos");
-    int aircraftForwardLoc = GetShaderLocation(shader, "aircraftForward");
-    SetShaderValue(shader, heightmapSizeLoc, (float[1]){(float)TILE_RES}, SHADER_UNIFORM_FLOAT);
-    SetShaderValue(shader, chunkResLoc, (float[1]){(float)CHUNK_RES}, SHADER_UNIFORM_FLOAT);
-    SetShaderValue(shader, chunkSizeLoc, (float[1]){(float)CHUNK_WORLD_SIZE}, SHADER_UNIFORM_FLOAT);
-
-    Vector3 lightDir = {0.5, 1.0, 0.5}; // TODO: sync with real life sun
-    SetShaderValue(shader, lightDirLoc, (float[3]){lightDir.x, lightDir.y, lightDir.z},
-                   SHADER_UNIFORM_VEC3);
-
-    rlDisableBackfaceCulling();
-    rlSetClipPlanes(1, 1000000);
-    while (!WindowShouldClose()) {
-        int width = GetRenderWidth();
-        int height = GetRenderHeight();
-        // printf("%dx%d\n", width, height);
-
-        handle_input(GetFrameTime());
-        update_camera_aircrat(&camera, &ac);
-
-        BeginDrawing();
-        ClearBackground((Color){28, 57, 195});
-
-        BeginMode3D(camera);
-
-        int tileMinX = 0;
-        int tileMinZ = 0;
-        int tileMaxX = NUM_CHUNKS - 1;
-        int tileMaxZ = NUM_CHUNKS - 1;
-        int tx = worldOffset.x / CHUNK_WORLD_SIZE;
-        int tz = worldOffset.z / CHUNK_WORLD_SIZE;
-
-        int viewDist = 5;
-        for (int dz = -viewDist; dz <= viewDist; dz++) {
-            for (int dx = -viewDist; dx <= viewDist; dx++) {
-                int cx = tx + dx;
-                int cz = tz + dz;
-
-                if (cx < tileMinX || cx > tileMaxX || cz < tileMinZ || cz > tileMaxZ)
-                    continue;
-
-                float offset[2] = {(float)cx, (float)cz};
-                SetShaderValue(shader, chunkOffsetLoc, offset, SHADER_UNIFORM_VEC2);
-
-                Vector3 worldPos = {cx * CHUNK_WORLD_SIZE + CHUNK_WORLD_SIZE * 0.5f, 0,
-                                    cz * CHUNK_WORLD_SIZE + CHUNK_WORLD_SIZE * 0.5f};
-
-                worldPos = Vector3Subtract(worldPos, worldOffset);
-
-                DrawModel(chunkModel, worldPos, 1.0f, WHITE);
-            }
-        }
-
-        EndMode3D();
-
-        EndTextureMode();
-
-        // aircraft symbol
-        Vector2 o = {width / 2.0, height / 2.0};
-        Vector2 left[3] = {{o.x - 120, o.y + 40}, {o.x - 80, o.y + 40}, o};
-        Vector2 right[3] = {{o.x + 120, o.y + 40}, {o.x + 80, o.y + 40}, o};
-        DrawTriangle(left[0], left[1], left[2], YELLOW);
-        DrawTriangleLines(left[0], left[1], left[2], BLACK);
-        DrawTriangle(right[0], right[1], right[2], YELLOW);
-        DrawTriangleLines(right[0], right[1], right[2], BLACK);
-
-        // debug
-        DrawFPS(10, 10);
-        DrawText(TextFormat("lat=%f", ac.lat), 10, 40, 20, WHITE);
-        DrawText(TextFormat("lon=%f", ac.lon), 10, 70, 20, WHITE);
-        DrawText(TextFormat("alt=%f", ac.alt), 10, 100, 20, WHITE);
-        DrawText(TextFormat("%.1f, %.1f, %.1f", worldOffset.x, worldOffset.y, worldOffset.z), 10,
-                 130, 20, WHITE);
-
-        EndDrawing();
+float *load_dem(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Failed to open %s\n", path);
+        return NULL;
     }
 
-    UnloadTexture(dem_tex);
+    size_t count = TILE_RES * TILE_RES;
+    float *data = malloc(count * sizeof(float));
+    if (!data) {
+        fprintf(stderr, "Out of memory\n");
+        fclose(f);
+        return NULL;
+    }
 
-    CloseWindow();
+    size_t read = fread(data, sizeof(float), count, f);
+    fclose(f);
+
+    if (read != count) {
+        fprintf(stderr, "File size mismatch: expected %zu floats, got %zu\n", count, read);
+        free(data);
+        return NULL;
+    }
+
+    return data;
+}
+
+void render_ui() {
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    igNewFrame();
+    {
+        igSetWindowPos_Vec2((ImVec2_c){10, 5}, 0);
+        igBegin("pos", NULL, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration);
+        igText("poop");
+        igEnd();
+    }
+    igRender();
+    ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData());
+}
+
+void render() {
+    static GLuint program = 0;
+    static Mesh plane;
+    if (!program) {
+        program = load_program("shaders/terrain.vs", "shaders/terrain.fs");
+        glUseProgram(program);
+
+        glUniform1f(glGetUniformLocation(program, "heightmapSize"), TILE_RES);
+        glUniform1f(glGetUniformLocation(program, "chunkSize"), CHUNK_WORLD_SIZE);
+        glUniform1i(glGetUniformLocation(program, "chunkRes"), CHUNK_RES);
+        glUniform3f(glGetUniformLocation(program, "aircraftPos"), world_offset.x, world_offset.y,
+                    world_offset.z);
+        glUniform3f(glGetUniformLocation(program, "aircraftForward"), ac.forward.x, ac.forward.y,
+                    ac.forward.z);
+
+        // Load DEM
+        GLuint dem_tex;
+        glGenTextures(1, &dem_tex);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, dem_tex);
+        float *pixels = load_dem("dem.raw");
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, TILE_RES, TILE_RES, 0, GL_RED, GL_FLOAT, pixels);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glUniform1i(glGetUniformLocation(program, "heightmap"), 0);
+        free(pixels);
+
+        plane = gen_plane(CHUNK_WORLD_SIZE, CHUNK_WORLD_SIZE, CHUNK_RES, CHUNK_RES);
+    }
+
+    int w, h;
+    SDL_GetWindowSizeInPixels(window, &w, &h);
+    glViewport(0, 0, w, h);
+    glClearColor(0.1, 0.2, 0.7, 1.0);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    mat4s view = glms_look(GLMS_VEC3_ZERO, ac.forward, ac.up);
+    mat4s proj = glms_perspective(glm_rad(60.0f), (float)w / (float)h, 0.1f, 1000000.0f);
+
+    glUseProgram(program);
+    int tileMinX = 0;
+    int tileMinZ = 0;
+    int tileMaxX = NUM_CHUNKS - 1;
+    int tileMaxZ = NUM_CHUNKS - 1;
+    int tx = world_offset.x / CHUNK_WORLD_SIZE;
+    int tz = world_offset.z / CHUNK_WORLD_SIZE;
+
+    int viewDist = 5;
+    for (int dz = -viewDist; dz <= viewDist; dz++) {
+        for (int dx = -viewDist; dx <= viewDist; dx++) {
+            int cx = tx + dx;
+            int cz = tz + dz;
+
+            if (cx < tileMinX || cx > tileMaxX || cz < tileMinZ || cz > tileMaxZ)
+                continue;
+
+            glUniform2f(glGetUniformLocation(program, "chunkOffset"), (float)cx, (float)cz);
+
+            vec3s world_pos = {cx * CHUNK_WORLD_SIZE + CHUNK_WORLD_SIZE * 0.5f, 0,
+                               cz * CHUNK_WORLD_SIZE + CHUNK_WORLD_SIZE * 0.5f};
+
+            world_pos = glms_vec3_sub(world_pos, world_offset);
+
+            // draw
+            mat4s model = glms_translate(GLMS_MAT4_IDENTITY, world_pos);
+            mat4s mvp = glms_mat4_mulN((mat4s *[]){&proj, &view, &model}, 3);
+            glUniformMatrix4fv(glGetUniformLocation(program, "mvp"), 1, GL_FALSE, (float *)mvp.raw);
+            glBindVertexArray(plane.vao);
+            glDrawElements(GL_TRIANGLES, plane.indexCount, GL_UNSIGNED_INT, 0);
+        }
+    }
+
+    render_ui();
+
+    SDL_GL_SwapWindow(window);
+}
+
+SDL_AppResult SDL_AppIterate(void *appstate) {
+
+    SDL_GetRelativeMouseState(&mouse_dx, &mouse_dy);
+    uint32_t now = SDL_GetTicks();
+    float dt = (now - last_tick) / 1000.0f;
+    last_tick = now;
+
+    update(dt);
+    render();
+
+    return SDL_APP_CONTINUE;
+}
+
+SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *e) {
+    ImGui_ImplSDL3_ProcessEvent(e);
+
+    switch (e->type) {
+    case SDL_EVENT_QUIT:
+        return SDL_APP_SUCCESS;
+    case SDL_EVENT_KEY_DOWN:
+        if (e->key.scancode == SDL_SCANCODE_C)
+            freecam = !freecam;
+        return SDL_APP_CONTINUE;
+    case SDL_EVENT_JOYSTICK_ADDED:
+        joy = SDL_OpenJoystick(e->jdevice.which);
+        return SDL_APP_CONTINUE;
+    }
+
+    return SDL_APP_CONTINUE;
+}
+
+SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
+    last_tick = SDL_GetTicks();
+
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
+    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
+
+    window =
+        SDL_CreateWindow("synvis", 1024, 768,
+                         SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_SetWindowRelativeMouseMode(window, true);
+    SDL_HideCursor();
+
+    SDL_GL_SetSwapInterval(1);
+    glctx = SDL_GL_CreateContext(window);
+    if (glewInit() != GLEW_OK) {
+        fprintf(stderr, "Failed to initialize GLEW\n");
+        return 1;
+    }
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_CULL_FACE);
+
+    // init imgui
+    ImGuiContext *imguictx = igCreateContext(NULL);
+    ImGuiIO *ioptr = igGetIO_ContextPtr(imguictx);
+    ioptr->ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    ImGuiStyle *style = igGetStyle();
+    style->FontScaleDpi = SDL_GetWindowDisplayScale(window);
+    ImGui_ImplSDL3_InitForOpenGL(window, glctx);
+    ImGui_ImplOpenGL3_Init("#version 330");
 
     return 0;
+}
+
+void SDL_AppQuit(void *appstate, SDL_AppResult result) {
+    SDL_CloseJoystick(joy);
+    SDL_GL_DestroyContext(glctx);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
 }
