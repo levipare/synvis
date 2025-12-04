@@ -1,16 +1,16 @@
-OBJS += lib/cimgui/cimgui.so
-OBJS += lib/cimgui/imgui/backends/imgui_impl_sdl3.o
-OBJS += lib/cimgui/imgui/backends/imgui_impl_opengl3.o
+OBJS += lib/cimgui/imgui/backends/imgui_impl_sdl3.o \
+		lib/cimgui/imgui/backends/imgui_impl_opengl3.o
+LIBS = lib/cimgui/libcimgui.a
 CXXFLAGS = -shared -fPIC -fno-exceptions -fno-rtti -Ilib/cimgui/imgui -DIMGUI_IMPL_API="extern \"C\""
 
 CFLAGS = -fPIC -Ilib/cimgui
-LDFLAGS = -lSDL3 -lGL -lGLEW -lm -lstdc++
+LDFLAGS = -Llib/cimgui -lcimgui -lSDL3 -lGL -lGLEW -lm -lstdc++
 
-all: $(OBJS)
-	$(CC) $(CFLAGS) $(LDFLAGS) main.c $(OBJS) 
+all: $(OBJS) $(LIBS)
+	$(CC)  main.c $(OBJS) $(CFLAGS) $(LDFLAGS) 
 
-lib/cimgui/cimgui.so:
-	$(MAKE) -Clib/cimgui
+lib/cimgui/libcimgui.a:
+	$(MAKE) static -Clib/cimgui
 
 lib/cimgui/imgui/backends/%.o: lib/cimgui/imgui/backends/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -19,5 +19,5 @@ clean:
 	rm -f a.out
 
 clean-all: clean
-	rm -f $(OBJS)
+	rm -f $(LIBS) $(OBJS)
 	$(MAKE) -Clib/cimgui clean
