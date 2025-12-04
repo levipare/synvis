@@ -1,6 +1,7 @@
 #ifndef AIRCRAFT_STATE_H
 #define AIRCRAFT_STATE_H
 
+#include <cglm/struct/vec3.h>
 #include <math.h>
 
 #include <cglm/struct.h>
@@ -51,34 +52,29 @@ vec3s geodetic_to_enu(double lat, double lon, double alt, double lat0, double lo
 }
 
 struct aircraft_state {
-    double lat, lon, alt;
-    float speed; // m/s
+    double lat, lon, height;
+    float throttle;
     vec3s forward, up, right;
 };
 
+#define SPEED 1000
 void aircraft_update(struct aircraft_state *a, float dt) {
-    float d = a->speed * dt; // meters traveled
+    float d = a->throttle * SPEED * dt; // meters traveled
 
-    float east = a->forward.x;
-    float up = a->forward.y;
-    float north = a->forward.z;
-
-    float dist_east = east * d;
-    float dist_north = north * d;
-    float dist_up = up * d;
+    vec3s dist = glms_vec3_scale(a->forward, d);
 
     // Meters per degree (local linearization)
     double metersPerDegLat = 111320.0; // TODO figure out this magic num
     double metersPerDegLon = 111320.0 * cos(glm_rad(a->lat));
 
     // convert motion to degrees
-    double dLat = dist_north / metersPerDegLat;
-    double dLon = dist_east / metersPerDegLon;
+    double dLat = dist.z / metersPerDegLat;
+    double dLon = dist.x / metersPerDegLon;
 
     // update geodetic position
     a->lat += dLat;
     a->lon += dLon;
-    a->alt += dist_up;
+    a->height += dist.y;
 }
 
 void aircraft_pitch(struct aircraft_state *a, float rad) {

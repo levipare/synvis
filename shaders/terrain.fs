@@ -3,7 +3,7 @@
 uniform float heightmapSize;
 uniform float chunkSize;
 
-in float waterDist;
+in float water;
 in vec3 normal;
 in vec3 fragWorldPos;
 
@@ -42,8 +42,7 @@ vec3 colorFromAltitude(float y) {
 
 void main() {
     vec3 base = colorFromAltitude(fragWorldPos.y);
-    float d = clamp(waterDist * heightmapSize, 0, 1);
-    vec3 color = mix(DARKBLUE, base, d);
+    vec3 color = mix(base, DARKBLUE, water);
 
     // shading
     vec3 norm = normalize(normal);

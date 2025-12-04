@@ -16,11 +16,34 @@
 
 #include "aircraft_state.h"
 
+struct mesh {
+    GLuint vao, vbo, ebo;
+    GLsizei index_count;
+};
+
+struct {
+    struct mesh mesh;
+    GLuint shader;
+    GLuint dem_tex;
+} terrain_model;
+
 static SDL_Window *window;
 static SDL_GLContext glctx;
 static SDL_Joystick *joy;
 static Uint64 last_tick;
 static float mouse_dx, mouse_dy;
+
+static bool freecam = true;
+static vec3s world_offset = {0, 0, 0};
+static struct aircraft_state ac = {
+    .throttle = 0,
+    .lat = 0,
+    .lon = 0,
+    .height = 0,
+    .forward = {0, 0, 1},
+    .up = {0, 1, 0},
+    .right = {-1, 0, 0},
+};
 
 #define TILE_RES 1200
 #define TILE_WORLD_SIZE (111320 * cos(glm_rad(44)))
@@ -28,8 +51,9 @@ static float mouse_dx, mouse_dy;
 #define CHUNK_RES (TILE_RES / NUM_CHUNKS)
 #define CHUNK_WORLD_SIZE (TILE_WORLD_SIZE / NUM_CHUNKS)
 
-#define CAMERA_SENS 0.1
-#define JOYSTICK_DEADZONE 0.1
+#define FREE_CAM_MOUSE_SENS 0.1
+#define FREE_CAM_SPEED 100
+#define FREE_CAM_FAST_MULTIPLIER 100
 
 GLuint compile_shader(const char *path, GLenum type) {
     FILE *f = fopen(path, "rb");
@@ -85,12 +109,7 @@ GLuint load_program(const char *vs, const char *fs) {
     return p;
 }
 
-typedef struct {
-    GLuint vao, vbo, ebo;
-    GLsizei indexCount;
-} Mesh;
-
-Mesh gen_plane(float w, float h, int resx, int resz) {
+struct mesh gen_plane(float w, float h, int resx, int resz) {
     int vx = resx + 1;
     int vz = resz + 1;
     int vcount = vx * vz;
@@ -122,7 +141,7 @@ Mesh gen_plane(float w, float h, int resx, int resz) {
             indices[idx++] = i + vx + 1;
         }
 
-    Mesh m;
+    struct mesh m;
     glGenVertexArrays(1, &m.vao);
     glBindVertexArray(m.vao);
 
@@ -140,26 +159,21 @@ Mesh gen_plane(float w, float h, int resx, int resz) {
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 5, (void *)(3 * sizeof(float)));
 
-    m.indexCount = resx * resz * 6;
+    m.index_count = resx * resz * 6;
 
     free(verts);
     free(indices);
     return m;
 }
 
-struct aircraft_state ac = {
-    .speed = 200,
-    .lat = 0,
-    .lon = 0,
-    .alt = 0,
-    .forward = {0, 0, 1},
-    .up = {0, 1, 0},
-    .right = {-1, 0, 0},
-};
+vec4s get_joystick_inputs() {
+    float pitch = -(float)SDL_GetJoystickAxis(joy, 1) / SDL_JOYSTICK_AXIS_MIN;
+    float roll = -(float)SDL_GetJoystickAxis(joy, 0) / SDL_JOYSTICK_AXIS_MIN;
+    float yaw = (float)SDL_GetJoystickAxis(joy, 2) / SDL_JOYSTICK_AXIS_MIN;
+    float throttle = (((float)SDL_GetJoystickAxis(joy, 3) / SDL_JOYSTICK_AXIS_MIN) + 1.0) / 2.0;
+    return (vec4s){pitch, yaw, roll, throttle};
+}
 
-vec3s world_offset = {0, 0, 0};
-
-bool freecam = true;
 void update(float dt) {
     const bool *keys = SDL_GetKeyboardState(NULL);
     if (freecam) {
@@ -181,9 +195,9 @@ void update(float dt) {
             glms_vec3_scale(ac.forward, move.z),
             glms_vec3_add(glms_vec3_scale(ac.right, move.x), glms_vec3_scale(ac.up, move.y)));
 
-        float speed = 100;
+        float speed = FREE_CAM_SPEED;
         if (keys[SDL_SCANCODE_LSHIFT])
-            speed *= 100;
+            speed *= FREE_CAM_FAST_MULTIPLIER;
 
         float ds = speed * dt; // m/s → meters per frame
         world_move = glms_vec3_scale(world_move, ds);
@@ -191,38 +205,83 @@ void update(float dt) {
         // Convert meters -> geodetic update
         ac.lat += world_move.z / 111320.0;                          // north (ENU y)
         ac.lon += world_move.x / (111320.0 * cos(glm_rad(ac.lat))); // east (ENU x)
-        ac.alt += world_move.y;                                     // up is ENU z
+        ac.height += world_move.y;                                  // up is ENU z
 
         // pitch
-        float pitch_angle = -mouse_dy * CAMERA_SENS * dt;
+        float pitch_angle = -mouse_dy * FREE_CAM_MOUSE_SENS * dt;
         ac.forward = glms_vec3_rotate(ac.forward, pitch_angle, ac.right);
         ac.right = glms_vec3_normalize(glms_vec3_cross(ac.forward, ac.up));
         // yaw
-        float yaw_angle = -mouse_dx * CAMERA_SENS * dt;
+        float yaw_angle = -mouse_dx * FREE_CAM_MOUSE_SENS * dt;
         ac.forward = glms_vec3_rotate(ac.forward, yaw_angle, ac.up);
     } else {
         aircraft_update(&ac, dt);
 
-        float pitch = (float)SDL_GetJoystickAxis(joy, 1) / SDL_JOYSTICK_AXIS_MIN;
-        aircraft_pitch(&ac, glm_rad(-pitch));
-        float roll = (float)SDL_GetJoystickAxis(joy, 0) / SDL_JOYSTICK_AXIS_MIN;
-        aircraft_roll(&ac, glm_rad(-roll));
-        float yaw = (float)SDL_GetJoystickAxis(joy, 2) / SDL_JOYSTICK_AXIS_MIN;
-        aircraft_yaw(&ac, glm_rad(yaw));
+        vec4s joy_inputs = get_joystick_inputs();
+        aircraft_pitch(&ac, glm_rad(joy_inputs.x));
+        aircraft_yaw(&ac, glm_rad(joy_inputs.y));
+        aircraft_roll(&ac, glm_rad(joy_inputs.z));
+        ac.throttle = joy_inputs.w;
     }
 
     // update world offset based on aircraft
     double lat0 = 0.0;
     double lon0 = 0.0;
     vec3s originECEF = geodetic_to_ecef(lat0, lon0, 0.0);
-    vec3s enu = geodetic_to_enu(glm_rad(ac.lat), glm_rad(ac.lon), ac.alt, lat0, lon0, originECEF);
+    vec3s enu =
+        geodetic_to_enu(glm_rad(ac.lat), glm_rad(ac.lon), ac.height, lat0, lon0, originECEF);
 
     world_offset.x = enu.x; // east
     world_offset.y = enu.z; // up
     world_offset.z = enu.y; // north
 }
 
-float *load_dem(const char *path) {
+void render_ui() {
+    int w, h;
+    SDL_GetWindowSize(window, &w, &h);
+    // glOrtho(0, w, 0, h, -1, 1);
+    // glMatrixMode(GL_MODELVIEW);
+    // glLoadIdentity();
+
+    // glBegin(GL_TRIANGLES);
+    // glColor3f(1.0f, 0.0f, 0.0f);
+    // glVertex2f(100, 100);
+    // glVertex2f(200, 100);
+    // glVertex2f(100, 200);
+    // glEnd();
+
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGui_ImplSDL3_NewFrame();
+    igNewFrame();
+    {
+        igSetNextWindowPos((ImVec2_c){10, 10}, ImGuiCond_Always, (ImVec2_c){0, 0});
+        igSetNextWindowSize((ImVec2_c){300, 0}, ImGuiCond_Always);
+        igSetNextWindowBgAlpha(0.35);
+        igBegin("pos", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
+        igText("LAT: %.5f°", ac.lat);
+        igText("LON: %.5f°", ac.lon);
+        igText("HGT: %.2fm", ac.height);
+        igText("X:   %.2f", world_offset.x);
+        igText("Y:   %.2f", world_offset.y);
+        igText("Z:   %.2f", world_offset.z);
+        igEnd();
+
+        igSetNextWindowPos((ImVec2_c){w - 10, 10}, ImGuiCond_Always, (ImVec2_c){1, 0});
+        igSetNextWindowSize((ImVec2_c){300, 0}, ImGuiCond_Always);
+        igSetNextWindowBgAlpha(0.35);
+        igBegin("inputs", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
+        vec4s ji = get_joystick_inputs();
+        igText("PITCH: %.2f", ji.x);
+        igText("YAW: %.2f", ji.y);
+        igText("ROLL: %.2f", ji.z);
+        igText("THROTTLE: %.2f", ji.w);
+        igEnd();
+    }
+    igRender();
+    ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData());
+}
+
+int16_t *load_dem(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
         fprintf(stderr, "Failed to open %s\n", path);
@@ -230,18 +289,18 @@ float *load_dem(const char *path) {
     }
 
     size_t count = TILE_RES * TILE_RES;
-    float *data = malloc(count * sizeof(float));
+    int16_t *data = malloc(count * sizeof(*data));
     if (!data) {
         fprintf(stderr, "Out of memory\n");
         fclose(f);
         return NULL;
     }
 
-    size_t read = fread(data, sizeof(float), count, f);
+    size_t read = fread(data, sizeof(*data), count, f);
     fclose(f);
 
     if (read != count) {
-        fprintf(stderr, "File size mismatch: expected %zu floats, got %zu\n", count, read);
+        fprintf(stderr, "File size mismatch: expected %zu values, got %zu\n", count, read);
         free(data);
         return NULL;
     }
@@ -249,52 +308,35 @@ float *load_dem(const char *path) {
     return data;
 }
 
-void render_ui() {
-    ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplSDL3_NewFrame();
-    igNewFrame();
-    {
-        igSetWindowPos_Vec2((ImVec2_c){10, 5}, 0);
-        igBegin("pos", NULL, ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDecoration);
-        igText("poop");
-        igEnd();
-    }
-    igRender();
-    ImGui_ImplOpenGL3_RenderDrawData(igGetDrawData());
+void make_terrain() {
+    terrain_model.mesh = gen_plane(CHUNK_WORLD_SIZE, CHUNK_WORLD_SIZE, CHUNK_RES, CHUNK_RES);
+    terrain_model.shader = load_program("shaders/terrain.vs", "shaders/terrain.fs");
+    glUseProgram(terrain_model.shader);
+
+    glUniform1f(glGetUniformLocation(terrain_model.shader, "heightmapSize"), TILE_RES);
+    glUniform1f(glGetUniformLocation(terrain_model.shader, "chunkSize"), CHUNK_WORLD_SIZE);
+    glUniform1i(glGetUniformLocation(terrain_model.shader, "chunkRes"), CHUNK_RES);
+    glUniform3f(glGetUniformLocation(terrain_model.shader, "aircraftPos"), world_offset.x,
+                world_offset.y, world_offset.z);
+    glUniform3f(glGetUniformLocation(terrain_model.shader, "aircraftForward"), ac.forward.x,
+                ac.forward.y, ac.forward.z);
+
+    // Load DEM
+    GLuint dem_tex;
+    glGenTextures(1, &dem_tex);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, dem_tex);
+    int16_t *pixels = load_dem("terrain.raw");
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R16I, TILE_RES, TILE_RES, 0, GL_RED_INTEGER, GL_SHORT,
+                 pixels);
+    free(pixels);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
 
 void render() {
-    static GLuint program = 0;
-    static Mesh plane;
-    if (!program) {
-        program = load_program("shaders/terrain.vs", "shaders/terrain.fs");
-        glUseProgram(program);
-
-        glUniform1f(glGetUniformLocation(program, "heightmapSize"), TILE_RES);
-        glUniform1f(glGetUniformLocation(program, "chunkSize"), CHUNK_WORLD_SIZE);
-        glUniform1i(glGetUniformLocation(program, "chunkRes"), CHUNK_RES);
-        glUniform3f(glGetUniformLocation(program, "aircraftPos"), world_offset.x, world_offset.y,
-                    world_offset.z);
-        glUniform3f(glGetUniformLocation(program, "aircraftForward"), ac.forward.x, ac.forward.y,
-                    ac.forward.z);
-
-        // Load DEM
-        GLuint dem_tex;
-        glGenTextures(1, &dem_tex);
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, dem_tex);
-        float *pixels = load_dem("dem.raw");
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, TILE_RES, TILE_RES, 0, GL_RED, GL_FLOAT, pixels);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        // glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-        glUniform1i(glGetUniformLocation(program, "heightmap"), 0);
-        free(pixels);
-
-        plane = gen_plane(CHUNK_WORLD_SIZE, CHUNK_WORLD_SIZE, CHUNK_RES, CHUNK_RES);
-    }
-
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
     glViewport(0, 0, w, h);
@@ -304,7 +346,7 @@ void render() {
     mat4s view = glms_look(GLMS_VEC3_ZERO, ac.forward, ac.up);
     mat4s proj = glms_perspective(glm_rad(60.0f), (float)w / (float)h, 0.1f, 1000000.0f);
 
-    glUseProgram(program);
+    glUseProgram(terrain_model.shader);
     int tileMinX = 0;
     int tileMinZ = 0;
     int tileMaxX = NUM_CHUNKS - 1;
@@ -321,7 +363,8 @@ void render() {
             if (cx < tileMinX || cx > tileMaxX || cz < tileMinZ || cz > tileMaxZ)
                 continue;
 
-            glUniform2f(glGetUniformLocation(program, "chunkOffset"), (float)cx, (float)cz);
+            glUniform2f(glGetUniformLocation(terrain_model.shader, "chunkOffset"), (float)cx,
+                        (float)cz);
 
             vec3s world_pos = {cx * CHUNK_WORLD_SIZE + CHUNK_WORLD_SIZE * 0.5f, 0,
                                cz * CHUNK_WORLD_SIZE + CHUNK_WORLD_SIZE * 0.5f};
@@ -331,9 +374,10 @@ void render() {
             // draw
             mat4s model = glms_translate(GLMS_MAT4_IDENTITY, world_pos);
             mat4s mvp = glms_mat4_mulN((mat4s *[]){&proj, &view, &model}, 3);
-            glUniformMatrix4fv(glGetUniformLocation(program, "mvp"), 1, GL_FALSE, (float *)mvp.raw);
-            glBindVertexArray(plane.vao);
-            glDrawElements(GL_TRIANGLES, plane.indexCount, GL_UNSIGNED_INT, 0);
+            glUniformMatrix4fv(glGetUniformLocation(terrain_model.shader, "mvp"), 1, GL_FALSE,
+                               (float *)mvp.raw);
+            glBindVertexArray(terrain_model.mesh.vao);
+            glDrawElements(GL_TRIANGLES, terrain_model.mesh.index_count, GL_UNSIGNED_INT, 0);
         }
     }
 
@@ -343,7 +387,6 @@ void render() {
 }
 
 SDL_AppResult SDL_AppIterate(void *appstate) {
-
     SDL_GetRelativeMouseState(&mouse_dx, &mouse_dy);
     uint32_t now = SDL_GetTicks();
     float dt = (now - last_tick) / 1000.0f;
@@ -362,8 +405,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *e) {
     case SDL_EVENT_QUIT:
         return SDL_APP_SUCCESS;
     case SDL_EVENT_KEY_DOWN:
-        if (e->key.scancode == SDL_SCANCODE_C)
+        if (e->key.scancode == SDL_SCANCODE_C) {
             freecam = !freecam;
+            ac.up = (vec3s){0, 1, 0};
+        }
         return SDL_APP_CONTINUE;
     case SDL_EVENT_JOYSTICK_ADDED:
         joy = SDL_OpenJoystick(e->jdevice.which);
@@ -404,6 +449,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     style->FontScaleDpi = SDL_GetWindowDisplayScale(window);
     ImGui_ImplSDL3_InitForOpenGL(window, glctx);
     ImGui_ImplOpenGL3_Init("#version 330");
+
+    make_terrain();
 
     return 0;
 }
