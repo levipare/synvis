@@ -2,6 +2,7 @@
 #include <SDL3/SDL_init.h>
 #include <SDL3/SDL_mouse.h>
 #include <SDL3/SDL_scancode.h>
+#include <cglm/struct/cam.h>
 #include <cglm/struct/vec3.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -47,6 +48,7 @@ static Uint64 last_tick;
 static float mouse_dx, mouse_dy;
 static ImGuiIO *igIO;
 
+static float far_z = 1000;
 static bool draw_ellipsoid = true;
 static bool draw_ui = false;
 static bool freecam = true;
@@ -54,9 +56,7 @@ static bool freecam = true;
 static struct aircraft_state ac = {
     .max_speed = 200,
     .throttle = 0,
-    .lat = 44,
-    .lon = -74,
-    .pos = {1266684.95 / 1000, -4417455.4 / 1000, 4408091.61 / 1000},
+    .pos = {1266704.78 / 1000, -4417524.54 / 1000, 4408161.08 / 1000},
     .forward = {1, 0, 0},
     .up = {0, 0, 1},
     .right = {0, 0, 1},
@@ -175,21 +175,14 @@ void update(float dt) {
             ac.throttle = joy_inputs.w;
         }
     }
+
+    ecef_to_geodetic(ac.pos, &ac.lat, &ac.lon,
+                     &ac.height); // TODO change where/how geodetic is stored
 }
 
 void render_ui() {
     int w, h;
     SDL_GetWindowSize(window, &w, &h);
-    // glOrtho(0, w, 0, h, -1, 1);
-    // glMatrixMode(GL_MODELVIEW);
-    // glLoadIdentity();
-
-    // glBegin(GL_TRIANGLES);
-    // glColor3f(1.0f, 0.0f, 0.0f);
-    // glVertex2f(100, 100);
-    // glVertex2f(200, 100);
-    // glVertex2f(100, 200);
-    // glEnd();
 
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplSDL3_NewFrame();
@@ -199,16 +192,18 @@ void render_ui() {
         igSetNextWindowSize((ImVec2_c){300, 0}, ImGuiCond_Always);
         igSetNextWindowBgAlpha(0.35);
         igBegin("pos", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoResize);
-        igText("LAT: %.5f°", ac.lat);
-        igText("LON: %.5f°", ac.lon);
-        igText("HGT: %.2fm", ac.height);
+        igText("LAT: %.5f°", glm_deg(ac.lat));
+        igText("LON: %.5f°", glm_deg(ac.lon));
+        igText("HGT: %.2fm", ac.height * 1000);
         igText("X:   %.2f", ac.pos.x);
         igText("Y:   %.2f", ac.pos.y);
         igText("Z:   %.2f", ac.pos.z);
         igEnd();
 
+        igSetNextWindowSize((ImVec2_c){0, 0}, ImGuiCond_Always);
         igBegin("Settings", NULL, 0);
         igCheckbox("Draw Ellipsoid", &draw_ellipsoid);
+        igSliderFloat("Far Z", &far_z, 1, 10000, "%.2f", 0);
         igEnd();
 
         igSetNextWindowPos((ImVec2_c){w - 10, 10}, ImGuiCond_Always, (ImVec2_c){1, 0});
@@ -259,7 +254,6 @@ void render_ellipsoid(mat4s view, mat4s proj) {
     mat4s model = GLMS_MAT4_IDENTITY;
     mat4s mvp = glms_mat4_mulN((mat4s *[]){&proj, &view, &model}, 3);
 
-    // draw
     glUseProgram(ellipsoid_model.shader);
     glUniformMatrix4fv(glGetUniformLocation(ellipsoid_model.shader, "mvp"), 1, GL_FALSE,
                        (float *)mvp.raw);
@@ -339,9 +333,9 @@ void render_terrain(mat4s view, mat4s proj) {
     for (int i = 0; i < terrain_model.num_tiles; i++) {
         struct tile *t = &terrain_model.tiles[i];
         // TODO better distance determination
-        vec3s ecef = geodetic_to_ecef(glm_rad(t->lat - 0.5), glm_rad(t->lon + 0.5), 0);
-        float dist = glms_vec3_distance(ecef, ac.pos);
-        if (dist < 200) {
+        float dist = glms_vec2_distance((vec2s){glm_deg(ac.lat), glm_deg(ac.lon)},
+                                        (vec2s){(float)t->lat - 0.5, (float)t->lon + 0.5});
+        if (dist < 1.5) {
             glUniform1f(glGetUniformLocation(terrain_model.shader, "lat"), t->lat);
             glUniform1f(glGetUniformLocation(terrain_model.shader, "lon"), t->lon);
             glActiveTexture(GL_TEXTURE0);
@@ -350,6 +344,31 @@ void render_terrain(mat4s view, mat4s proj) {
             glDrawElements(GL_TRIANGLES, terrain_model.mesh.index_count, GL_UNSIGNED_INT, 0);
         }
     }
+}
+
+void draw_triangle(vec2s v0, vec2s v1, vec2s v2, vec3s color) {
+    glUseProgram(0);
+    glBindVertexArray(0);
+    int w, h;
+    SDL_GetWindowSizeInPixels(window, &w, &h);
+
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, w, h, 0, -1, 1);
+
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+
+    glPushMatrix();
+
+    glBegin(GL_TRIANGLES);
+    glColor3f(color.r, color.g, color.b);
+    glVertex2fv(v0.raw);
+    glVertex2fv(v1.raw);
+    glVertex2fv(v2.raw);
+    glEnd();
+
+    glPopMatrix();
 }
 
 void render() {
@@ -361,13 +380,37 @@ void render() {
 
     mat4s view = glms_look(GLMS_VEC3_ZERO, ac.forward, ac.up);
     view = glms_translate(view, glms_vec3_negate(ac.pos));
-    mat4s proj = glms_perspective(glm_rad(60.0f), (float)w / (float)h, 0.1f, 1000);
+    mat4s proj = glms_perspective(glm_rad(60.0f), (float)w / (float)h, 0.1f, far_z);
 
     render_terrain(view, proj);
     if (draw_ellipsoid)
         render_ellipsoid(view, proj);
     if (draw_ui)
         render_ui();
+
+    // render aircraft symbol
+    vec2s o = {w / 2.0, h / 2.0};
+    vec2s tri[] = {
+        o,
+        {o.x - 100, o.y + 50},
+        {o.x - 70, o.y + 50},
+    };
+    vec2s tri2[] = {
+        o,
+        {o.x + 100, o.y + 50},
+        {o.x + 70, o.y + 50},
+    };
+
+    vec3s yellow = {1, 1, 0};
+    vec3s black = {0, 0, 0};
+    draw_triangle(tri[0], tri[1], tri[2], yellow);
+    draw_triangle(tri2[0], tri2[1], tri2[2], yellow);
+
+    glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glLineWidth(2);
+    draw_triangle(tri[0], tri[1], tri[2], black);
+    draw_triangle(tri2[0], tri2[1], tri2[2], black);
+    glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 
     SDL_GL_SwapWindow(window);
 }
@@ -394,6 +437,10 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *e) {
         if (e->key.scancode == SDL_SCANCODE_C) {
             freecam = !freecam;
         }
+        if (e->key.scancode == SDL_SCANCODE_N) {
+            ac.up = glms_vec3_normalize(ac.pos);
+            ac.right = glms_vec3_normalize(glms_cross(ac.forward, ac.up));
+        }
         if (e->key.scancode == SDL_SCANCODE_ESCAPE) {
             if (SDL_GetWindowRelativeMouseMode(window)) {
                 SDL_SetWindowRelativeMouseMode(window, false);
@@ -403,6 +450,9 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *e) {
         }
         if (e->key.scancode == SDL_SCANCODE_TAB) {
             draw_ui = !draw_ui;
+            if (!draw_ui && !SDL_GetWindowRelativeMouseMode(window)) {
+                SDL_SetWindowRelativeMouseMode(window, true);
+            }
         }
         return SDL_APP_CONTINUE;
     case SDL_EVENT_JOYSTICK_ADDED:
@@ -421,11 +471,14 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
     SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
 
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+
     window =
         SDL_CreateWindow("synvis", 1024, 768,
                          SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     SDL_SetWindowRelativeMouseMode(window, true);
-    SDL_HideCursor();
 
     SDL_GL_SetSwapInterval(1);
     glctx = SDL_GL_CreateContext(window);
@@ -435,6 +488,8 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
     }
     glEnable(GL_DEPTH_TEST);
     // glEnable(GL_CULL_FACE);
+    printf("GL Version: %s\n", glGetString(GL_VERSION));
+    printf("GL Renderer: %s\n", glGetString(GL_RENDERER));
 
     // init imgui
     ImGuiContext *imguictx = igCreateContext(NULL);
