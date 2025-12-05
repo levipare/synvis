@@ -1,11 +1,8 @@
 #version 330
 
-uniform float heightmapSize;
-uniform float chunkSize;
-
 in float water;
+in float height;
 in vec3 normal;
-in vec3 fragWorldPos;
 
 out vec4 fragColor;
 
@@ -41,7 +38,7 @@ vec3 colorFromAltitude(float y) {
 }
 
 void main() {
-    vec3 base = colorFromAltitude(fragWorldPos.y);
+    vec3 base = colorFromAltitude(height);
     vec3 color = mix(base, DARKBLUE, water);
 
     // shading
@@ -52,13 +49,14 @@ void main() {
     // grid
     // TODO fix spacing of grid to be accurate
     // 1 arc-minute spacing
-    float spacingNS = 1855.0;
-    float spacingEW = 1855.0 * cos(radians(fragWorldPos.z / 111320.0));
-    float lineWidth = 10.0;
+    // float spacingNS = 1855.0;
+    // float spacingEW = 1855.0 * cos(radians(fragWorldPos.z / 111320.0));
+    // float lineWidth = 10.0;
 
-    if (mod(fragWorldPos.z, spacingNS) < lineWidth || mod(fragWorldPos.x, spacingEW) < lineWidth) {
-        color *= 0.5;
-    }
+    // if (mod(fragWorldPos.z, spacingNS) < lineWidth || mod(fragWorldPos.x, spacingEW) < lineWidth)
+    // {
+    //     color *= 0.5;
+    // }
 
     fragColor = vec4(color, 1.0);
 }
